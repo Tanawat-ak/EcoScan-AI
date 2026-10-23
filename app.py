@@ -1,12 +1,19 @@
 import streamlit as st
 import json
 import re
+
 from google import genai
 from google.genai import types
 
 from knowledge_base import get_rule_by_contamination
 
 MODEL = "gemini-3.6-flash"
+
+# ต่ำกว่าค่านี้ หรือโมเดลตอบ unknown -> ไม่แสดงคำแนะนำ ให้ถ่ายรูปใหม่
+CONFIDENCE_THRESHOLD = 0.70
+
+VALID_CATEGORIES = {"recyclable", "general", "organic", "hazardous", "unknown"}
+VALID_CONTAMINATION = {"low", "medium", "high"}
 
 
 @st.cache_resource
@@ -18,25 +25,84 @@ client = get_client()
 
 
 # =========================
+# Parse ผลจาก Gemini อย่างปลอดภัย
+# =========================
+def parse_vision_response(text):
+    """
+    แปลงข้อความที่โมเดลตอบเป็น dict ที่ครบทุกฟิลด์เสมอ
+    คืน None ถ้าอ่าน JSON ไม่ได้เลย
+    """
+    if not text:
+        return None
+
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group())
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    category = str(data.get("category", "unknown")).strip().lower()
+    if category not in VALID_CATEGORIES:
+        category = "unknown"
+
+    contamination = str(data.get("contamination", "low")).strip().lower()
+    if contamination not in VALID_CONTAMINATION:
+        contamination = "low"
+
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if 1.0 < confidence <= 100.0:  # โมเดลตอบเป็นเปอร์เซ็นต์ เช่น 95
+        confidence = confidence / 100.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    return {
+        "item": str(data.get("item", "ไม่ทราบ")),
+        "category": category,
+        "contamination": contamination,
+        "confidence": confidence,
+    }
+
+
+def needs_retake(vision_result):
+    """True ถ้าควรให้ผู้ใช้ถ่ายรูปใหม่ แทนที่จะแสดงคำแนะนำ"""
+    return (
+        vision_result["category"] == "unknown"
+        or vision_result["confidence"] < CONFIDENCE_THRESHOLD
+    )
+
+
+# =========================
 # Gemini Vision
 # =========================
 def analyze_waste(image_bytes, mime_type):
 
     prompt = """
-วิเคราะห์รูปขยะนี้และตอบเป็น JSON เท่านั้น
+    วิเคราะห์รูปขยะนี้และตอบเป็น JSON เท่านั้น
 
-{
-  "item": "ชื่อสิ่งของ",
-  "category": "recyclable/general/organic/hazardous",
-  "contamination": "low/medium/high",
-  "confidence": 0.0
-}
+    {
+      "item": "ชื่อสิ่งของ",
+      "category": "recyclable/general/organic/hazardous/unknown",
+      "contamination": "low/medium/high",
+      "confidence": 0.0
+    }
 
-ให้พิจารณาด้วยว่าวัตถุนั้นมีเศษอาหาร ของเหลว
-หรือสิ่งปนเปื้อนติดอยู่หรือไม่
+    ให้พิจารณาด้วยว่าวัตถุนั้นมีเศษอาหาร ของเหลว
+    หรือสิ่งปนเปื้อนติดอยู่หรือไม่
 
-ห้ามใส่ข้อความอื่นนอก JSON
-"""
+    ถ้าในรูปไม่มีขยะที่ชัดเจน ภาพเบลอ มืดเกินไป
+    หรือไม่แน่ใจว่าเป็นอะไร ให้ตอบ category เป็น "unknown"
+    และให้ confidence ต่ำ
+
+    ห้ามใส่ข้อความอื่นนอก JSON
+    """
 
     resp = client.models.generate_content(
         model=MODEL,
@@ -49,18 +115,14 @@ def analyze_waste(image_bytes, mime_type):
         ]
     )
 
-    match = re.search(r'\{.*\}', resp.text, re.DOTALL)
-
-    if not match:
-        return None
-
-    return json.loads(match.group())
+    return parse_vision_response(resp.text)
 
 
 # =========================
 # Demo Data
 # =========================
 DEMO_RESULTS = {
+
     "ตุ๊กตา": {
         "item": "ตุ๊กตา",
         "category": "general",
@@ -110,7 +172,6 @@ st.set_page_config(
 st.title("♻️ EcoScan AI")
 st.caption("AI Waste Sorting Assistant")
 
-
 # Demo Mode
 demo_mode = st.sidebar.toggle(
     "🧪 Demo Mode",
@@ -123,12 +184,10 @@ if demo_mode:
         "ระบบจะไม่เรียก Gemini API"
     )
 
-
 uploaded_file = st.file_uploader(
     "📷 Upload waste image",
     type=["jpg", "jpeg", "png"]
 )
-
 
 if uploaded_file:
 
@@ -164,7 +223,6 @@ if uploaded_file:
             st.success("🧪 Demo Result")
 
             st.divider()
-
             st.subheader("Result")
 
             st.write(
@@ -213,60 +271,61 @@ if uploaded_file:
             if vision_result is None:
 
                 st.error(
-                    "ไม่สามารถอ่านผลจาก AI ได้"
+                    "ไม่สามารถอ่านผลจาก AI ได้ กรุณาลองใหม่อีกครั้ง"
+                )
+                st.stop()
+
+            # ---- ไม่มั่นใจ / ระบุไม่ได้ -> ไม่แสดงคำแนะนำ ----
+            if needs_retake(vision_result):
+
+                st.warning(
+                    "⚠️ AI ไม่มั่นใจในภาพนี้ "
+                    "กรุณาถ่ายรูปใหม่ให้เห็นสิ่งของชัดเจนขึ้น "
+                    "แสงสว่างพอ และมีชิ้นเดียวในภาพ"
+                )
+                st.stop()
+
+            category = vision_result["category"]
+            contamination = vision_result["contamination"]
+            confidence = vision_result["confidence"]
+
+            rule = get_rule_by_contamination(
+                category,
+                contamination
+            )
+
+            if rule is None:
+
+                st.error(
+                    "ไม่พบข้อมูลการทิ้งสำหรับประเภทนี้"
                 )
 
             else:
 
-                category = vision_result["category"]
-                contamination = vision_result["contamination"]
-                confidence = vision_result["confidence"]
+                st.divider()
+                st.subheader("Result")
 
-                rule = get_rule_by_contamination(
-                    category,
-                    contamination
+                st.write(
+                    f"🗑️ **Item:** "
+                    f"{vision_result['item']}"
                 )
 
-                if confidence < 0.70:
+                st.write(
+                    f"♻️ **Waste Type:** "
+                    f"{rule['name']}"
+                )
 
-                    st.warning(
-                        "⚠️ AI ไม่มั่นใจในภาพนี้ "
-                        "กรุณาถ่ายรูปใหม่"
-                    )
+                st.write(
+                    f"🗑️ **Disposal Bin:** "
+                    f"{rule['bin_color']}"
+                )
 
-                if rule is None:
+                st.write(
+                    f"🎯 **Confidence:** "
+                    f"{confidence * 100:.0f}%"
+                )
 
-                    st.error(
-                        "ไม่พบข้อมูลการทิ้งสำหรับประเภทนี้"
-                    )
-
-                else:
-
-                    st.divider()
-
-                    st.subheader("Result")
-
-                    st.write(
-                        f"🗑️ **Item:** "
-                        f"{vision_result['item']}"
-                    )
-
-                    st.write(
-                        f"♻️ **Waste Type:** "
-                        f"{rule['name']}"
-                    )
-
-                    st.write(
-                        f"🗑️ **Disposal Bin:** "
-                        f"{rule['bin_color']}"
-                    )
-
-                    st.write(
-                        f"🎯 **Confidence:** "
-                        f"{confidence * 100:.0f}%"
-                    )
-
-                    st.write(
-                        f"💡 **Disposal Guide:** "
-                        f"{rule['instruction']}"
-                    )
+                st.write(
+                    f"💡 **Disposal Guide:** "
+                    f"{rule['instruction']}"
+                )
